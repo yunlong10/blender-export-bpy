@@ -51,6 +51,12 @@ class ExportBpyCode(bpy.types.Operator, ExportHelper):
         default=False,
     )
 
+    skip_hidden: BoolProperty(
+        name="Skip Hidden Objects",
+        description="Don't export objects hidden in viewport (eye icon off)",
+        default=False,
+    )
+
     decimal_places: EnumProperty(
         name="Precision",
         description="Number of decimal places for coordinates",
@@ -162,6 +168,8 @@ class ExportBpyCode(bpy.types.Operator, ExportHelper):
                 continue
             if obj.type == 'LIGHT' and not self.include_lights:
                 continue
+            if self.skip_hidden and obj.hide_viewport:
+                continue
 
             loc = self._round_tuple(obj.location, dp)
             rot = self._round_tuple(obj.rotation_euler, dp)
@@ -175,6 +183,12 @@ class ExportBpyCode(bpy.types.Operator, ExportHelper):
             elif obj.type == 'EMPTY':
                 scale = self._round_tuple(obj.scale, dp)
                 self._export_empty(lines, obj, loc, rot, scale, dp)
+
+            # Preserve visibility state
+            if obj.hide_viewport:
+                lines.append(f"obj.hide_viewport = True")
+            if obj.hide_render:
+                lines.append(f"obj.hide_render = True")
 
             lines.append("")
 
