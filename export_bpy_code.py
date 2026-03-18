@@ -300,7 +300,7 @@ class ExportBpyCode(bpy.types.Operator, ExportHelper):
             self._write_obj_header(lines, obj, rot)
             lines.append(f"obj.scale = {export_scale}")
 
-        elif fcount >= 30 and fcount <= 66:
+        elif fcount >= 30 and fcount <= 66 and self._is_cylinder_like(mesh, vcount, fcount):
             if fcount <= 35 and self._is_cone_like(mesh):
                 # --- Cone (32-side: 33 verts, 33 faces) ---
                 local_radius = max(mesh_bbox[0], mesh_bbox[1]) / 2
@@ -468,6 +468,54 @@ class ExportBpyCode(bpy.types.Operator, ExportHelper):
             return False
         return (min_dist / max_dist) > 0.2
 
+    def _is_cylinder_like(self, mesh, vcount, fcount):
+        """
+        Verify that a mesh is actually a cylinder, not just any mesh with
+        30-66 faces. A standard n-sided cylinder has verts=2n, faces=n+2.
+        Also checks for circular vertex distribution.
+        """
+        # Check if vcount/fcount matches the cylinder formula: verts = 2*(faces-2)
+        expected_verts = 2 * (fcount - 2)
+        if abs(vcount - expected_verts) > 4:
+            return False
+
+        # Check for circular distribution: vertices should cluster at two Z levels
+        # (top and bottom caps) and form circles at each level
+        z_values = [v.co[2] for v in mesh.vertices]
+        z_min, z_max = min(z_values), max(z_values)
+        z_range = z_max - z_min
+        if z_range < 0.0001:
+            return False
+
+        # Split vertices into top and bottom halves
+        z_mid = (z_min + z_max) / 2
+        top_verts = [v.co for v in mesh.vertices if v.co[2] > z_mid]
+        bot_verts = [v.co for v in mesh.vertices if v.co[2] <= z_mid]
+
+        # Both halves should have similar count (roughly n each)
+        if not top_verts or not bot_verts:
+            return False
+        if max(len(top_verts), len(bot_verts)) > 2 * min(len(top_verts), len(bot_verts)):
+            return False
+
+        # Check if XY distribution is roughly circular in at least one half
+        import math
+        def is_circular(verts_2d):
+            if len(verts_2d) < 8:
+                return False
+            cx = sum(v[0] for v in verts_2d) / len(verts_2d)
+            cy = sum(v[1] for v in verts_2d) / len(verts_2d)
+            dists = [math.sqrt((v[0]-cx)**2 + (v[1]-cy)**2) for v in verts_2d]
+            avg_d = sum(dists) / len(dists)
+            if avg_d < 0.0001:
+                return False
+            variance = sum((d - avg_d)**2 for d in dists) / len(dists)
+            # Low variance relative to mean = circular
+            return (variance / (avg_d * avg_d)) < 0.05
+
+        top_xy = [(v[0], v[1]) for v in top_verts]
+        return is_circular(top_xy)
+
     def _is_cone_like(self, mesh):
         """Heuristic: cone has one apex vertex where many edges converge."""
         if len(mesh.vertices) < 10:
@@ -490,13 +538,29 @@ def menu_func_export(self, context):
 
 
 def register():
+    # Prevent duplicate registration when running via Script Editor
+    try:
+        bpy.utils.unregister_class(ExportBpyCode)
+    except RuntimeError:
+        pass
+    try:
+        bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
+    except ValueError:
+        pass
+
     bpy.utils.register_class(ExportBpyCode)
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
 
 
 def unregister():
-    bpy.utils.unregister_class(ExportBpyCode)
-    bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
+    try:
+        bpy.utils.unregister_class(ExportBpyCode)
+    except RuntimeError:
+        pass
+    try:
+        bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
+    except ValueError:
+        pass
 
 
 if __name__ == "__main__":
