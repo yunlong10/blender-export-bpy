@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Export Scene as BPY Code",
     "author": "BVB Tools",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (3, 6, 0),
     "location": "File > Export > Blender Python Script (.py)",
     "description": "Export the current scene as a reproducible bpy Python script",
@@ -47,8 +47,8 @@ class ExportBpyCode(bpy.types.Operator, ExportHelper):
 
     include_render_settings: BoolProperty(
         name="Include Render Settings",
-        description="Export render engine and resolution settings",
-        default=False,
+        description="Export render engine, resolution, and world environment settings",
+        default=True,
     )
 
     skip_hidden: BoolProperty(
@@ -74,6 +74,7 @@ class ExportBpyCode(bpy.types.Operator, ExportHelper):
     def export_scene(self, context, filepath):
         dp = int(self.decimal_places)
         lines = []
+        self._complex_meshes = []  # Track non-primitive meshes
 
         lines.append('"""')
         lines.append(f"Blender Scene: {bpy.path.basename(bpy.data.filepath) or 'Untitled'}")
@@ -111,12 +112,41 @@ class ExportBpyCode(bpy.types.Operator, ExportHelper):
             lines.append(f"bpy.context.scene.render.resolution_percentage = {scene.render.resolution_percentage}")
             if scene.render.engine == 'CYCLES':
                 lines.append(f"bpy.context.scene.cycles.samples = {scene.cycles.samples}")
+            elif scene.render.engine == 'BLENDER_EEVEE':
+                if hasattr(scene.eevee, 'taa_render_samples'):
+                    lines.append(f"bpy.context.scene.eevee.taa_render_samples = {scene.eevee.taa_render_samples}")
             lines.append("")
+
+            # World / environment
+            world = scene.world
+            if world and world.use_nodes:
+                lines.append("# World Environment")
+                lines.append("world = bpy.context.scene.world")
+                lines.append("if world is None:")
+                lines.append("    world = bpy.data.worlds.new('World')")
+                lines.append("    bpy.context.scene.world = world")
+                lines.append("world.use_nodes = True")
+                lines.append("_bg = world.node_tree.nodes.get('Background')")
+                lines.append("if _bg:")
+                for node in world.node_tree.nodes:
+                    if node.type == 'BACKGROUND':
+                        bg_color = self._round_tuple(
+                            node.inputs['Color'].default_value, dp)
+                        bg_strength = round(
+                            node.inputs['Strength'].default_value, dp)
+                        lines.append(
+                            f"    _bg.inputs['Color'].default_value = {bg_color}")
+                        lines.append(
+                            f"    _bg.inputs['Strength'].default_value = {bg_strength}")
+                        break
+                lines.append("")
 
         # --- Materials ---
         lines.append("# ============================================================")
         lines.append("# Materials")
         lines.append("# ============================================================")
+        self._linked_materials = []  # Track materials with non-trivial node setups
+
         for mat in bpy.data.materials:
             if not mat.use_nodes or not mat.node_tree:
                 continue
@@ -127,6 +157,13 @@ class ExportBpyCode(bpy.types.Operator, ExportHelper):
                     break
             if not bsdf:
                 continue
+
+            # Warn about linked inputs (textures, color ramps, etc.)
+            bc_input = bsdf.inputs['Base Color']
+            if bc_input.is_linked:
+                from_node = bc_input.links[0].from_node
+                self._linked_materials.append(
+                    f"{mat.name} (Base Color <- {from_node.type})")
 
             var = self._mat_var(mat.name)
             bc = self._round_tuple(bsdf.inputs['Base Color'].default_value, dp)
@@ -162,6 +199,8 @@ class ExportBpyCode(bpy.types.Operator, ExportHelper):
         lines.append("# ============================================================")
         lines.append("# Objects")
         lines.append("# ============================================================")
+
+        self._complex_meshes = []  # Track complex meshes for warning
 
         for obj in bpy.data.objects:
             if obj.type == 'CAMERA' and not self.include_camera:
@@ -207,7 +246,23 @@ class ExportBpyCode(bpy.types.Operator, ExportHelper):
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(code)
 
-        self.report({'INFO'}, f"Exported {len(bpy.data.objects)} objects to {filepath}")
+        # Report results
+        warnings = []
+        if self._complex_meshes:
+            names = ', '.join(self._complex_meshes[:8])
+            suffix = f' (+{len(self._complex_meshes) - 8} more)' if len(self._complex_meshes) > 8 else ''
+            warnings.append(
+                f"{len(self._complex_meshes)} complex mesh(es) approximated as cubes: {names}{suffix}")
+        if self._linked_materials:
+            names = ', '.join(self._linked_materials[:5])
+            warnings.append(
+                f"{len(self._linked_materials)} material(s) use textures/nodes (only fallback color exported): {names}")
+
+        if warnings:
+            self.report({'WARNING'},
+                f"Exported {len(bpy.data.objects)} objects. " + " | ".join(warnings))
+        else:
+            self.report({'INFO'}, f"Exported {len(bpy.data.objects)} objects to {filepath}")
         return {'FINISHED'}
 
     # ================================================================
@@ -246,17 +301,33 @@ class ExportBpyCode(bpy.types.Operator, ExportHelper):
             lines.append(f"obj.scale = {export_scale}")
 
         elif fcount >= 30 and fcount <= 66:
-            # --- Cylinder (32-side default) ---
-            local_radius = max(mesh_bbox[0], mesh_bbox[1]) / 2
-            local_depth = mesh_bbox[2]
-            eff_radius = round(local_radius * max(sx, sy), dp)
-            eff_depth = round(local_depth * sz, dp)
-            lines.append(f"bpy.ops.mesh.primitive_cylinder_add(vertices=32, radius={eff_radius}, depth={eff_depth}, location={loc})")
+            if fcount <= 35 and self._is_cone_like(mesh):
+                # --- Cone (32-side: 33 verts, 33 faces) ---
+                local_radius = max(mesh_bbox[0], mesh_bbox[1]) / 2
+                local_depth = mesh_bbox[2]
+                eff_radius = round(local_radius * max(sx, sy), dp)
+                eff_depth = round(local_depth * sz, dp)
+                lines.append(f"bpy.ops.mesh.primitive_cone_add(vertices=32, radius1={eff_radius}, depth={eff_depth}, location={loc})")
+                self._write_obj_header(lines, obj, rot)
+            else:
+                # --- Cylinder (32-side default) ---
+                local_radius = max(mesh_bbox[0], mesh_bbox[1]) / 2
+                local_depth = mesh_bbox[2]
+                eff_radius = round(local_radius * max(sx, sy), dp)
+                eff_depth = round(local_depth * sz, dp)
+                lines.append(f"bpy.ops.mesh.primitive_cylinder_add(vertices=32, radius={eff_radius}, depth={eff_depth}, location={loc})")
+                self._write_obj_header(lines, obj, rot)
+                # Handle non-uniform XY scaling (elliptical cross-section)
+                if abs(sx - sy) > 0.001 and sy != 0:
+                    ratio = round(sx / sy, dp)
+                    lines.append(f"obj.scale = ({ratio}, 1.0, 1.0)")
+
+        elif vcount >= 100 and self._is_torus_like(mesh, vcount, fcount):
+            # --- Torus ---
+            major_r = round((mesh_bbox[0] + mesh_bbox[1]) / 4 * max(sx, sy), dp)
+            minor_r = round(mesh_bbox[2] / 2 * sz, dp)
+            lines.append(f"bpy.ops.mesh.primitive_torus_add(major_radius={major_r}, minor_radius={minor_r}, location={loc})")
             self._write_obj_header(lines, obj, rot)
-            # Handle non-uniform XY scaling (elliptical cross-section)
-            if abs(sx - sy) > 0.001 and sy != 0:
-                ratio = round(sx / sy, dp)
-                lines.append(f"obj.scale = ({ratio}, 1.0, 1.0)")
 
         elif vcount >= 100 and self._is_sphere_like(mesh):
             # --- Sphere ---
@@ -266,10 +337,11 @@ class ExportBpyCode(bpy.types.Operator, ExportHelper):
 
         else:
             # --- Complex mesh (approximated as cube) ---
+            self._complex_meshes.append(f"{obj.name} ({vcount}v/{fcount}f)")
             export_scale = self._round_tuple(
                 (mesh_bbox[0] * sx, mesh_bbox[1] * sy, mesh_bbox[2] * sz), dp)
-            lines.append(f"# NOTE: Complex mesh '{obj.name}' (verts={vcount}, faces={fcount})")
-            lines.append(f"# Approximated as cube — replace with imported geometry for exact match")
+            lines.append(f"# WARNING: Complex mesh '{obj.name}' (verts={vcount}, faces={fcount})")
+            lines.append(f"# Approximated as cube — replace with primitives for exact reconstruction")
             lines.append(f"bpy.ops.mesh.primitive_cube_add(size=1, location={loc})")
             self._write_obj_header(lines, obj, rot)
             lines.append(f"obj.scale = {export_scale}")
@@ -378,6 +450,36 @@ class ExportBpyCode(bpy.types.Operator, ExportHelper):
             return False
         variance = sum((d - avg) ** 2 for d in dists) / len(dists)
         return (variance / (avg * avg)) < 0.05
+
+    def _is_torus_like(self, mesh, vcount, fcount):
+        """Heuristic: torus has equal vert/face count and a hole in the center."""
+        if abs(vcount - fcount) > 2:
+            return False
+        # Check for hole: center of mesh should have no vertices nearby
+        import mathutils
+        center = mathutils.Vector((0, 0, 0))
+        for v in mesh.vertices:
+            center += v.co
+        center /= vcount
+        min_dist = min((v.co - center).length for v in mesh.vertices)
+        max_dist = max((v.co - center).length for v in mesh.vertices)
+        # Torus has a hole, so min_dist should be significantly > 0
+        if max_dist < 0.001:
+            return False
+        return (min_dist / max_dist) > 0.2
+
+    def _is_cone_like(self, mesh):
+        """Heuristic: cone has one apex vertex where many edges converge."""
+        if len(mesh.vertices) < 10:
+            return False
+        # Find the vertex connected to the most edges
+        edge_count = {}
+        for e in mesh.edges:
+            for vi in e.vertices:
+                edge_count[vi] = edge_count.get(vi, 0) + 1
+        max_edges = max(edge_count.values()) if edge_count else 0
+        # Cone apex connects to all base vertices (32 for 32-side cone)
+        return max_edges >= 16
 
 
 # ============================================================
