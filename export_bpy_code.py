@@ -166,32 +166,69 @@ class ExportBpyCode(bpy.types.Operator, ExportHelper):
                     f"{mat.name} (Base Color <- {from_node.type})")
 
             var = self._mat_var(mat.name)
-            bc = self._round_tuple(bsdf.inputs['Base Color'].default_value, dp)
-            rough = round(bsdf.inputs['Roughness'].default_value, dp)
-            metal = round(bsdf.inputs['Metallic'].default_value, dp)
-
             lines.append(f"{var} = bpy.data.materials.new(name='{mat.name}')")
             lines.append(f"{var}.use_nodes = True")
             lines.append(f"_bsdf = {var}.node_tree.nodes['Principled BSDF']")
+
+            # Always export these three core values
+            bc = self._round_tuple(bsdf.inputs['Base Color'].default_value, dp)
             lines.append(f"_bsdf.inputs['Base Color'].default_value = {bc}")
-            lines.append(f"_bsdf.inputs['Roughness'].default_value = {rough}")
-            lines.append(f"_bsdf.inputs['Metallic'].default_value = {metal}")
+            lines.append(f"_bsdf.inputs['Roughness'].default_value = {round(bsdf.inputs['Roughness'].default_value, dp)}")
+            lines.append(f"_bsdf.inputs['Metallic'].default_value = {round(bsdf.inputs['Metallic'].default_value, dp)}")
 
-            # Alpha (only if non-opaque)
+            # Export all other Principled BSDF scalar/color inputs when
+            # they deviate from the Blender default.
+            _BSDF_DEFAULTS = {
+                'IOR': 1.5,
+                'Alpha': 1.0,
+                'Diffuse Roughness': 0.0,
+                'Subsurface Weight': 0.0,   'Subsurface': 0.0,
+                'Subsurface Scale': 0.05,
+                'Subsurface IOR': 1.4,
+                'Subsurface Anisotropy': 0.0,
+                'Specular IOR Level': 0.5,  'Specular': 0.5,
+                'Anisotropic': 0.0,         'Anisotropic Rotation': 0.0,
+                'Transmission Weight': 0.0, 'Transmission': 0.0,
+                'Coat Weight': 0.0,         'Clearcoat': 0.0,
+                'Coat Roughness': 0.03,     'Clearcoat Roughness': 0.03,
+                'Coat IOR': 1.5,
+                'Sheen Weight': 0.0,        'Sheen': 0.0,
+                'Sheen Roughness': 0.5,
+                'Emission Strength': 0.0,
+                'Thin Film Thickness': 0.0,
+                'Thin Film IOR': 1.33,
+            }
+            _BSDF_COLOR_DEFAULTS = {
+                'Specular Tint': (1.0, 1.0, 1.0, 1.0),
+                'Coat Tint': (1.0, 1.0, 1.0, 1.0),
+                'Sheen Tint': (1.0, 1.0, 1.0, 1.0),
+                'Emission Color': (1.0, 1.0, 1.0, 1.0),
+                'Subsurface Radius': (1.0, 0.2, 0.1),
+            }
+            already = {'Base Color', 'Roughness', 'Metallic'}
+            for name, default in _BSDF_DEFAULTS.items():
+                if name in already or name not in bsdf.inputs:
+                    continue
+                val = bsdf.inputs[name].default_value
+                if abs(val - default) > 0.0005:
+                    lines.append(f"_bsdf.inputs['{name}'].default_value = {round(val, dp)}")
+                    already.add(name)
+            for name, default in _BSDF_COLOR_DEFAULTS.items():
+                if name not in bsdf.inputs:
+                    continue
+                val = tuple(bsdf.inputs[name].default_value)
+                if any(abs(a - b) > 0.0005 for a, b in zip(val, default)):
+                    lines.append(f"_bsdf.inputs['{name}'].default_value = {self._round_tuple(val, dp)}")
+
+            # Blend mode for translucent materials
             if 'Alpha' in bsdf.inputs:
-                alpha = round(bsdf.inputs['Alpha'].default_value, dp)
+                alpha = bsdf.inputs['Alpha'].default_value
                 if alpha < 0.999:
-                    lines.append(f"_bsdf.inputs['Alpha'].default_value = {alpha}")
                     lines.append(f"{var}.blend_method = 'BLEND'")
-
-            # Emission (only export if strength > 0)
-            if 'Emission Strength' in bsdf.inputs:
-                es = bsdf.inputs['Emission Strength'].default_value
-                if es > 0.001:
-                    lines.append(f"_bsdf.inputs['Emission Strength'].default_value = {round(es, dp)}")
-                    if 'Emission Color' in bsdf.inputs:
-                        ec = self._round_tuple(bsdf.inputs['Emission Color'].default_value, dp)
-                        lines.append(f"_bsdf.inputs['Emission Color'].default_value = {ec}")
+            # Transmission also needs blend mode in EEVEE
+            tw_name = 'Transmission Weight' if 'Transmission Weight' in bsdf.inputs else 'Transmission'
+            if tw_name in bsdf.inputs and bsdf.inputs[tw_name].default_value > 0.001:
+                lines.append(f"{var}.blend_method = 'BLEND'")
 
             lines.append("")
 
