@@ -301,19 +301,15 @@ class ExportBpyCode(bpy.types.Operator, ExportHelper):
             lines.append(f"obj.scale = {export_scale}")
 
         elif vcount >= 100 and self._is_torus_like(mesh, vcount, fcount):
-            # --- Torus (before cylinder — similar tri-count meshes) ---
+            # --- Torus ---
             major_r = round((mesh_bbox[0] + mesh_bbox[1]) / 4 * max(sx, sy), dp)
             minor_r = round(mesh_bbox[2] / 2 * sz, dp)
             lines.append(f"bpy.ops.mesh.primitive_torus_add(major_radius={major_r}, minor_radius={minor_r}, location={loc})")
             self._write_obj_header(lines, obj, rot)
 
-        elif vcount >= 50 and self._is_sphere_like(mesh):
-            # --- Sphere ---
-            eff_radius = round(max(mesh_bbox) / 2 * max(obj.scale), dp)
-            lines.append(f"bpy.ops.mesh.primitive_uv_sphere_add(radius={eff_radius}, location={loc})")
-            self._write_obj_header(lines, obj, rot)
-
         elif (cyl := self._analyze_cylinder(mesh, vcount, fcount)):
+            # --- Cylinder / cone (before sphere — cylinders have equidistant
+            #     vertices that fool the sphere radial-variance check) ---
             # --- Cylinder / cone (triangulated caps, high segment count, any local axis) ---
             ax = cyl['axis']
             rot_c = self._rotation_for_aligned_cylinder(obj, ax, dp)
@@ -334,6 +330,12 @@ class ExportBpyCode(bpy.types.Operator, ExportHelper):
                 if ax == 2 and abs(sx - sy) > 0.001 and sy != 0:
                     ratio = round(sx / sy, dp)
                     lines.append(f"obj.scale = ({ratio}, 1.0, 1.0)")
+
+        elif vcount >= 100 and self._is_sphere_like(mesh):
+            # --- Sphere ---
+            eff_radius = round(max(mesh_bbox) / 2 * max(obj.scale), dp)
+            lines.append(f"bpy.ops.mesh.primitive_uv_sphere_add(radius={eff_radius}, location={loc})")
+            self._write_obj_header(lines, obj, rot)
 
         else:
             # --- Complex mesh (approximated as cube) ---
@@ -436,15 +438,27 @@ class ExportBpyCode(bpy.types.Operator, ExportHelper):
         return tuple(bbox)
 
     def _is_sphere_like(self, mesh):
-        """Rough heuristic: check if mesh is roughly spherical."""
-        if len(mesh.vertices) < 50:
+        """Rough heuristic: check if mesh is roughly spherical.
+        Requires both low radial variance AND a roughly cubic bounding box,
+        so that flat cylinders / discs don't pass."""
+        if len(mesh.vertices) < 100:
             return False
         import mathutils
+        verts = [v.co for v in mesh.vertices]
+        # Bounding box aspect ratio: sphere ≈ cube
+        mn = [min(v[i] for v in verts) for i in range(3)]
+        mx = [max(v[i] for v in verts) for i in range(3)]
+        dims = sorted(mx[i] - mn[i] for i in range(3))
+        if dims[2] < 0.001:
+            return False
+        if dims[0] / dims[2] < 0.4:
+            return False
+        # Radial variance
         center = mathutils.Vector((0, 0, 0))
-        for v in mesh.vertices:
-            center += v.co
-        center /= len(mesh.vertices)
-        dists = [(v.co - center).length for v in mesh.vertices]
+        for v in verts:
+            center += v
+        center /= len(verts)
+        dists = [(v - center).length for v in verts]
         avg = sum(dists) / len(dists)
         if avg < 0.001:
             return False
@@ -535,7 +549,7 @@ class ExportBpyCode(bpy.types.Operator, ExportHelper):
             return None
         if vcount >= 100 and self._is_torus_like(mesh, vcount, fcount):
             return None
-        if vcount >= 50 and self._is_sphere_like(mesh):
+        if vcount >= 100 and self._is_sphere_like(mesh):
             return None
 
         ngon_expected_v = 2 * (fcount - 2)
