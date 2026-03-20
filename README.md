@@ -66,8 +66,8 @@ blender --background --python my_scene.py
 |---------|-------------------|
 | Cubes (8 verts, 6 faces) | `bpy.ops.mesh.primitive_cube_add()` |
 | Planes (4 verts, 1 face) | `bpy.ops.mesh.primitive_plane_add()` |
-| Cylinders (32-side) | `bpy.ops.mesh.primitive_cylinder_add()` |
-| Cones (32-side) | `bpy.ops.mesh.primitive_cone_add()` |
+| Cylinders (32-side in script) | `bpy.ops.mesh.primitive_cylinder_add()` — detected by geometry (triangulated caps, more sides, local axis along X/Y/Z) |
+| Cones | `bpy.ops.mesh.primitive_cone_add()` — same detection path as cylinders |
 | UV Spheres | `bpy.ops.mesh.primitive_uv_sphere_add()` |
 | Tori | `bpy.ops.mesh.primitive_torus_add()` |
 | Complex meshes | ⚠️ Cube fallback + warning (see below) |

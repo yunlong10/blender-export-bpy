@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Export Scene as BPY Code",
     "author": "BVB Tools",
-    "version": (1, 2, 0),
+    "version": (1, 2, 1),
     "blender": (3, 6, 0),
     "location": "File > Export > Blender Python Script (.py)",
     "description": "Export the current scene as a reproducible bpy Python script",
@@ -300,40 +300,40 @@ class ExportBpyCode(bpy.types.Operator, ExportHelper):
             self._write_obj_header(lines, obj, rot)
             lines.append(f"obj.scale = {export_scale}")
 
-        elif fcount >= 30 and fcount <= 66 and self._is_cylinder_like(mesh, vcount, fcount):
-            if fcount <= 35 and self._is_cone_like(mesh):
-                # --- Cone (32-side: 33 verts, 33 faces) ---
-                local_radius = max(mesh_bbox[0], mesh_bbox[1]) / 2
-                local_depth = mesh_bbox[2]
-                eff_radius = round(local_radius * max(sx, sy), dp)
-                eff_depth = round(local_depth * sz, dp)
-                lines.append(f"bpy.ops.mesh.primitive_cone_add(vertices=32, radius1={eff_radius}, depth={eff_depth}, location={loc})")
-                self._write_obj_header(lines, obj, rot)
-            else:
-                # --- Cylinder (32-side default) ---
-                local_radius = max(mesh_bbox[0], mesh_bbox[1]) / 2
-                local_depth = mesh_bbox[2]
-                eff_radius = round(local_radius * max(sx, sy), dp)
-                eff_depth = round(local_depth * sz, dp)
-                lines.append(f"bpy.ops.mesh.primitive_cylinder_add(vertices=32, radius={eff_radius}, depth={eff_depth}, location={loc})")
-                self._write_obj_header(lines, obj, rot)
-                # Handle non-uniform XY scaling (elliptical cross-section)
-                if abs(sx - sy) > 0.001 and sy != 0:
-                    ratio = round(sx / sy, dp)
-                    lines.append(f"obj.scale = ({ratio}, 1.0, 1.0)")
-
         elif vcount >= 100 and self._is_torus_like(mesh, vcount, fcount):
-            # --- Torus ---
+            # --- Torus (before cylinder — similar tri-count meshes) ---
             major_r = round((mesh_bbox[0] + mesh_bbox[1]) / 4 * max(sx, sy), dp)
             minor_r = round(mesh_bbox[2] / 2 * sz, dp)
             lines.append(f"bpy.ops.mesh.primitive_torus_add(major_radius={major_r}, minor_radius={minor_r}, location={loc})")
             self._write_obj_header(lines, obj, rot)
 
-        elif vcount >= 100 and self._is_sphere_like(mesh):
+        elif vcount >= 50 and self._is_sphere_like(mesh):
             # --- Sphere ---
             eff_radius = round(max(mesh_bbox) / 2 * max(obj.scale), dp)
             lines.append(f"bpy.ops.mesh.primitive_uv_sphere_add(radius={eff_radius}, location={loc})")
             self._write_obj_header(lines, obj, rot)
+
+        elif (cyl := self._analyze_cylinder(mesh, vcount, fcount)):
+            # --- Cylinder / cone (triangulated caps, high segment count, any local axis) ---
+            ax = cyl['axis']
+            rot_c = self._rotation_for_aligned_cylinder(obj, ax, dp)
+            local_depth, local_radius, s_depth, s_r1, s_r2 = (
+                self._cylinder_bbox_scales(mesh_bbox, ax, sx, sy, sz))
+            eff_radius = round(local_radius * max(s_r1, s_r2), dp)
+            eff_depth = round(local_depth * s_depth, dp)
+            if cyl['is_cone']:
+                lines.append(
+                    f"bpy.ops.mesh.primitive_cone_add(vertices=32, radius1={eff_radius}, depth={eff_depth}, location={loc})")
+                self._write_obj_header(lines, obj, rot_c)
+            else:
+                lines.append(
+                    f"bpy.ops.mesh.primitive_cylinder_add(vertices=32, radius={eff_radius}, depth={eff_depth}, location={loc})")
+                self._write_obj_header(lines, obj, rot_c)
+                # Elliptical cross-section only when height is Z (no extra align);
+                # after X/Y align, non-uniform scale maps messily to local axes.
+                if ax == 2 and abs(sx - sy) > 0.001 and sy != 0:
+                    ratio = round(sx / sy, dp)
+                    lines.append(f"obj.scale = ({ratio}, 1.0, 1.0)")
 
         else:
             # --- Complex mesh (approximated as cube) ---
@@ -468,53 +468,123 @@ class ExportBpyCode(bpy.types.Operator, ExportHelper):
             return False
         return (min_dist / max_dist) > 0.2
 
-    def _is_cylinder_like(self, mesh, vcount, fcount):
+    def _axis_span(self, mesh, axis):
+        vals = [v.co[axis] for v in mesh.vertices]
+        return max(vals) - min(vals)
+
+    def _is_circular_2d(self, verts_2d):
+        """Low radial variance around centroid → circular cap in projection."""
+        if len(verts_2d) < 6:
+            return False
+        cx = sum(v[0] for v in verts_2d) / len(verts_2d)
+        cy = sum(v[1] for v in verts_2d) / len(verts_2d)
+        dists = [math.hypot(v[0] - cx, v[1] - cy) for v in verts_2d]
+        avg_d = sum(dists) / len(dists)
+        if avg_d < 1e-5:
+            return False
+        variance = sum((d - avg_d) ** 2 for d in dists) / len(dists)
+        return (variance / (avg_d * avg_d)) < 0.08
+
+    def _cylinder_geometry_along_axis(self, mesh, axis):
+        """True if verts split along `axis` into two stacks with circular cross-section."""
+        verts = mesh.vertices
+        if len(verts) < 8:
+            return False
+
+        def coord(vco):
+            return vco[axis]
+
+        def proj(vco):
+            if axis == 0:
+                return (vco[1], vco[2])
+            if axis == 1:
+                return (vco[0], vco[2])
+            return (vco[0], vco[1])
+
+        vals = [coord(v.co) for v in verts]
+        vmin, vmax = min(vals), max(vals)
+        if vmax - vmin < 1e-5:
+            return False
+        vmid = (vmin + vmax) / 2
+        top = [v.co for v in verts if coord(v.co) > vmid]
+        bot = [v.co for v in verts if coord(v.co) <= vmid]
+        if not top or not bot:
+            return False
+        if max(len(top), len(bot)) > 2 * min(len(top), len(bot)) + 6:
+            return False
+
+        top_xy = [proj(v) for v in top]
+        bot_xy = [proj(v) for v in bot]
+        ok_top = self._is_circular_2d(top_xy)
+        ok_bot = self._is_circular_2d(bot_xy)
+        if ok_top and ok_bot:
+            return True
+        # Cone: one bucket is the apex (few verts), the other is the base cap
+        if ok_top and len(bot_xy) <= 8:
+            return True
+        if ok_bot and len(top_xy) <= 8:
+            return True
+        return False
+
+    def _analyze_cylinder(self, mesh, vcount, fcount):
         """
-        Verify that a mesh is actually a cylinder, not just any mesh with
-        30-66 faces. A standard n-sided cylinder has verts=2n, faces=n+2.
-        Also checks for circular vertex distribution.
+        Detect cylinder/cone including triangulated caps, high segment counts,
+        and mesh-local axis not aligned to Z (edit-mode rotation).
         """
-        # Check if vcount/fcount matches the cylinder formula: verts = 2*(faces-2)
-        expected_verts = 2 * (fcount - 2)
-        if abs(vcount - expected_verts) > 4:
-            return False
+        if vcount < 8 or fcount < 10 or fcount > 520:
+            return None
+        if vcount >= 100 and self._is_torus_like(mesh, vcount, fcount):
+            return None
+        if vcount >= 50 and self._is_sphere_like(mesh):
+            return None
 
-        # Check for circular distribution: vertices should cluster at two Z levels
-        # (top and bottom caps) and form circles at each level
-        z_values = [v.co[2] for v in mesh.vertices]
-        z_min, z_max = min(z_values), max(z_values)
-        z_range = z_max - z_min
-        if z_range < 0.0001:
-            return False
+        ngon_expected_v = 2 * (fcount - 2)
+        loosely_prism = (
+            abs(vcount - ngon_expected_v) <= max(8, vcount // 6)
+            or (
+                vcount >= 16
+                and fcount >= vcount // 2
+                and fcount <= vcount * 6 + 8
+            )
+        )
+        if not loosely_prism and (vcount > 320 or fcount > 520):
+            return None
 
-        # Split vertices into top and bottom halves
-        z_mid = (z_min + z_max) / 2
-        top_verts = [v.co for v in mesh.vertices if v.co[2] > z_mid]
-        bot_verts = [v.co for v in mesh.vertices if v.co[2] <= z_mid]
+        candidates = []
+        for a in (2, 0, 1):
+            if self._cylinder_geometry_along_axis(mesh, a):
+                candidates.append((self._axis_span(mesh, a), a))
+        if not candidates:
+            return None
+        axis = max(candidates, key=lambda t: t[0])[1]
+        return {'axis': axis, 'is_cone': self._is_cone_like(mesh)}
 
-        # Both halves should have similar count (roughly n each)
-        if not top_verts or not bot_verts:
-            return False
-        if max(len(top_verts), len(bot_verts)) > 2 * min(len(top_verts), len(bot_verts)):
-            return False
+    def _rotation_for_aligned_cylinder(self, obj, axis, dp):
+        """`primitive_*_cylinder/cone` is Z-high; rotate object if mesh height is on X/Y."""
+        import mathutils
 
-        # Check if XY distribution is roughly circular in at least one half
-        import math
-        def is_circular(verts_2d):
-            if len(verts_2d) < 8:
-                return False
-            cx = sum(v[0] for v in verts_2d) / len(verts_2d)
-            cy = sum(v[1] for v in verts_2d) / len(verts_2d)
-            dists = [math.sqrt((v[0]-cx)**2 + (v[1]-cy)**2) for v in verts_2d]
-            avg_d = sum(dists) / len(dists)
-            if avg_d < 0.0001:
-                return False
-            variance = sum((d - avg_d)**2 for d in dists) / len(dists)
-            # Low variance relative to mean = circular
-            return (variance / (avg_d * avg_d)) < 0.05
+        if axis == 2:
+            return self._round_tuple(obj.rotation_euler, dp)
+        if axis == 0:
+            e_align = mathutils.Euler((0.0, math.pi / 2, 0.0), 'XYZ')
+        else:
+            e_align = mathutils.Euler((-math.pi / 2, 0.0, 0.0), 'XYZ')
+        e_orig = mathutils.Euler(obj.rotation_euler, 'XYZ')
+        m = e_orig.to_matrix() @ e_align.to_matrix()
+        e = m.to_euler('XYZ')
+        return self._round_tuple((e.x, e.y, e.z), dp)
 
-        top_xy = [(v[0], v[1]) for v in top_verts]
-        return is_circular(top_xy)
+    def _cylinder_bbox_scales(self, mesh_bbox, axis, sx, sy, sz):
+        """
+        Bounding-box height along cylinder axis and radius from the other two axes;
+        returns (depth, radius, scale_depth, scale_r1, scale_r2).
+        """
+        bx, by, bz = mesh_bbox
+        if axis == 0:
+            return bx, max(by, bz) / 2, sx, sy, sz
+        if axis == 1:
+            return by, max(bx, bz) / 2, sy, sx, sz
+        return bz, max(bx, by) / 2, sz, sx, sy
 
     def _is_cone_like(self, mesh):
         """Heuristic: cone has one apex vertex where many edges converge."""
